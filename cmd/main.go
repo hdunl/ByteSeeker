@@ -14,36 +14,31 @@ import (
 	"time"
 )
 
-// ScannerConfig holds the configuration for the scanner
 type ScannerConfig struct {
 	baseURL       string
 	pathsFile     string
 	concurrent    int
 	timeout       time.Duration
-	userAgents    []string // List of user agents for rotation
+	userAgents    []string
 	adaptiveDelay time.Duration
 }
 
-// dnsCacheEntry represents a single DNS cache entry
 type dnsCacheEntry struct {
 	ip        string
 	timestamp time.Time
 }
 
-// dnsCache is a thread-safe DNS cache
 type dnsCache struct {
 	entries map[string]dnsCacheEntry
 	mutex   sync.RWMutex
 }
 
-// newDNSCache creates a new DNS cache
 func newDNSCache() *dnsCache {
 	return &dnsCache{
 		entries: make(map[string]dnsCacheEntry),
 	}
 }
 
-// lookup performs a DNS lookup with caching
 func (c *dnsCache) lookup(host string) (string, error) {
 	c.mutex.RLock()
 	if entry, found := c.entries[host]; found && time.Since(entry.timestamp) < 5*time.Minute {
@@ -65,7 +60,6 @@ func (c *dnsCache) lookup(host string) (string, error) {
 	return ip, nil
 }
 
-// cachedDialContext is a custom DialContext function that uses the DNS cache
 func (c *dnsCache) cachedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	separator := strings.LastIndex(addr, ":")
 	host, port := addr[:separator], addr[separator:]
