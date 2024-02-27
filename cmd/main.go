@@ -1,239 +1,230 @@
 package main
 
-import (
-	"bufio"
-	"context"
-	"flag"
-	"fmt"
-	"math/rand"
-	"net"
-	"net/http"
-	"os"
-	"strings"
-	"sync"
-	"time"
-)
+import "flag"
+import "fmt"
+import "math/rand"
+import "net"
+import "net/http"
+import "os"
+import "strings"
+import "sync"
+import "sync/atomic"
+import "time"
 
 type ScannerConfig struct {
-	baseURL       string
-	pathsFile     string
-	concurrent    int
-	timeout       time.Duration
-	userAgents    []string
-	adaptiveDelay time.Duration
+	BaseURL       string
+	PathsFile     string
+	Concurrent    int
+	Timeout       time.Duration
+	AdaptiveDelay time.Duration
 }
 
-type dnsCacheEntry struct {
-	ip        string
-	timestamp time.Time
+func NewDefaultScannerConfig() *ScannerConfig {
+	return &ScannerConfig{
+		BaseURL:       "https://example.com",
+		PathsFile:     "./paths.txt",
+		Concurrent:    10,
+		Timeout:       10 * time.Second,
+		AdaptiveDelay: 100 * time.Millisecond,
+	}
+}
+
+func check(err error) {
+	if err != nil {
+		panic(err)
+	}
 }
 
 type dnsCache struct {
-	entries map[string]dnsCacheEntry
-	mutex   sync.RWMutex
+	cache map[string]*net.IPAddr
+	mux   sync.Mutex
 }
 
-func newDNSCache() *dnsCache {
+func _() *dnsCache {
 	return &dnsCache{
-		entries: make(map[string]dnsCacheEntry),
+		cache: make(map[string]*net.IPAddr),
 	}
 }
 
-func (c *dnsCache) lookup(host string) (string, error) {
-	c.mutex.RLock()
-	if entry, found := c.entries[host]; found && time.Since(entry.timestamp) < 5*time.Minute {
-		c.mutex.RUnlock()
-		return entry.ip, nil
+func (dc *dnsCache) resolve(host string) (*net.IPAddr, error) {
+	dc.mux.Lock()
+	defer dc.mux.Unlock()
+
+	if ip, exist := dc.cache[host]; exist {
+		return ip, nil
 	}
-	c.mutex.RUnlock()
 
 	ips, err := net.LookupHost(host)
-	if err != nil {
-		return "", err
-	}
-	ip := ips[0]
+	check(err)
 
-	c.mutex.Lock()
-	c.entries[host] = dnsCacheEntry{ip: ip, timestamp: time.Now()}
-	c.mutex.Unlock()
+	ip := net.ParseIP(ips[0])
+	dc.cache[host] = &net.IPAddr{IP: ip}
 
-	return ip, nil
+	return dc.cache[host], nil
 }
 
-func (c *dnsCache) cachedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	separator := strings.LastIndex(addr, ":")
-	host, port := addr[:separator], addr[separator:]
-
-	ip, err := c.lookup(host)
-	if err != nil {
-		return nil, err
+func newHttpClient(timeout time.Duration) *http.Client {
+	transport := &http.Transport{
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       timeout,
+		DisableKeepAlives:     true,
+		TLSHandshakeTimeout:   timeout,
+		ExpectContinueTimeout: timeout,
 	}
-	addr = ip + port
 
-	dialer := net.Dialer{}
-	return dialer.DialContext(ctx, network, addr)
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}
+
+	return client
 }
 
-func scanTarget(client *http.Client, baseURL, path string, wg *sync.WaitGroup, results chan<- string, userAgents []string, adaptiveDelay *time.Duration) {
+func scanTarget(baseURL string, path string, wg *sync.WaitGroup, results chan<- string, userAgents []string, adaptiveDelay *time.Duration, concurrent *int32, timeout time.Duration) {
 	defer wg.Done()
 
-	userAgent := userAgents[rand.Intn(len(userAgents))]
+	atomic.AddInt32(concurrent, -1)
+	defer atomic.AddInt32(concurrent, 1)
 
-	var resp *http.Response
-	var err error
+	delay := *adaptiveDelay
+
 	for i := 0; i < 3; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), client.Timeout)
-		defer cancel()
+		fullURL := baseURL + path
+		fullURL = strings.TrimSpace(fullURL)
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
+		client := newHttpClient(timeout)
+
+		req, err := http.NewRequest("GET", fullURL, nil)
 		if err != nil {
-			cancel()
-			results <- fmt.Sprintf("Error creating request for %s: %s\n", path, err)
-			return
+			results <- fmt.Sprintf("[ERROR] Failed to create request for %s: %v\n", fullURL, err)
+			continue
 		}
-		req.Header.Set("User-Agent", userAgent)
+		req.Close = true
 
-		resp, err = client.Do(req)
-		cancel()
-		if err == nil && resp != nil {
-			defer resp.Body.Close()
+		agent := userAgents[rand.Intn(len(userAgents))]
+		req.Header.Set("User-Agent", agent)
+
+		start := time.Now()
+		resp, err := client.Do(req)
+		_ = start
+
+		if err != nil {
+			if resp == nil {
+				results <- fmt.Sprintf("[ERROR] Failed to scan %s%s: %v\n", baseURL, path, err)
+			}
+			time.Sleep(delay)
+			delay *= 2
+			continue
+		}
+
+		statusCode := resp.StatusCode
+		resp.Body.Close()
+
+		if statusCode >= 200 && statusCode < 300 {
+			results <- fmt.Sprintf("[SUCCESS] Found %s%s\n", baseURL, path)
+			break
+		} else if statusCode == http.StatusTooManyRequests {
+			results <- fmt.Sprintf("[RATE LIMIT] Too Many Requests %s%s (Status: %d)\n", baseURL, path, statusCode)
 			break
 		}
-		time.Sleep(*adaptiveDelay)
-		*adaptiveDelay *= 2
-	}
 
-	if err != nil {
-		results <- fmt.Sprintf("Error scanning %s: %s\n", path, err)
-		return
-	}
-
-	if resp != nil {
-		switch resp.StatusCode {
-		case http.StatusOK:
-			results <- fmt.Sprintf("Found: %s\n", baseURL+path)
-		case http.StatusTooManyRequests:
-			results <- fmt.Sprintf("Rate limited on %s\n", baseURL+path)
-		default:
-		}
+		time.Sleep(delay)
+		delay *= 2
 	}
 }
 
 func loadPaths(filePath string) ([]string, error) {
-	file, err := os.Open(filePath)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
-	var paths []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		paths = append(paths, scanner.Text())
+	lines := strings.Split(string(data), "\n")
+	validLines := make([]string, 0, len(lines))
+
+	for _, line := range lines {
+		if len(strings.TrimSpace(line)) > 0 {
+			validLines = append(validLines, line)
+		}
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return paths, nil
+
+	return validLines, nil
 }
 
-func runScanner(config ScannerConfig) {
-	paths, err := loadPaths(config.pathsFile)
-	if err != nil {
-		fmt.Printf("Failed to load paths: %s\n", err)
-		return
-	}
+func parseFlags() *ScannerConfig {
+	cfg := NewDefaultScannerConfig()
 
-	dnsCache := newDNSCache()
-	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     90 * time.Second,
-		DialContext:         dnsCache.cachedDialContext,
-	}
-	client := &http.Client{
-		Timeout:   config.timeout,
-		Transport: transport,
-	}
+	flag.StringVar(&cfg.BaseURL, "url", cfg.BaseURL, "Base URL for scanning.")
+	flag.StringVar(&cfg.PathsFile, "paths", cfg.PathsFile, "A file containing the paths to scan separated by new lines.")
+	flag.IntVar(&cfg.Concurrent, "concurrent", cfg.Concurrent, "Number of concurrent workers.")
+	flag.DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "Total timeout for the scan.")
+	flag.DurationVar(&cfg.AdaptiveDelay, "adaptive-delay", cfg.AdaptiveDelay, "Adaptive delay between requests.")
 
-	var wg sync.WaitGroup
-	tasksChan := make(chan string, config.concurrent)
-	resultsChan := make(chan string, config.concurrent)
+	flag.Parse()
 
-	for i := 0; i < config.concurrent; i++ {
-		go func() {
-			for path := range tasksChan {
-				wg.Add(1)
-				scanTarget(client, config.baseURL, path, &wg, resultsChan, config.userAgents, &config.adaptiveDelay)
-			}
-		}()
-	}
-
-	go func() {
-		for result := range resultsChan {
-			fmt.Print(result)
-		}
-	}()
-
-	startTime := time.Now()
-
-	for _, path := range paths {
-		tasksChan <- path
-	}
-	close(tasksChan)
-
-	wg.Wait()
-	close(resultsChan)
-
-	duration := time.Since(startTime)
-	fmt.Printf("Checked %d URLs in %s using %d goroutines\n", len(paths), duration, config.concurrent)
+	return cfg
 }
 
 func main() {
-	baseURL := flag.String("url", "", "Base URL to scan")
-	pathsFile := flag.String("paths", "", "File containing paths to scan")
-	concurrent := flag.Int("concurrent", 10, "Number of concurrent goroutines for scanning")
-	timeout := flag.Duration("timeout", 10*time.Second, "HTTP request timeout")
-	adaptiveDelay := flag.Duration("adaptiveDelay", 100*time.Millisecond, "Initial adaptive delay between requests")
-	flag.Parse()
+	cfg := parseFlags()
 
-	if *baseURL == "" || *pathsFile == "" {
-		fmt.Println("url and paths flags are required")
-		flag.Usage()
-		return
-	}
+	concurrent32 := int32(cfg.Concurrent)
+
+	paths, err := loadPaths(cfg.PathsFile)
+	check(err)
 
 	userAgents := []string{
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15",
-		"Mozilla/5.0 (iPad; CPU OS 13_2_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 Mobile/15E148 Safari/604.1",
-		"Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 Mobile/15E148 Safari/604.1",
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.150 Safari/537.36",
+		"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/54.0.2840.99 Safari/537.36",
+		"Mozilla/5.0 (iPad; CPU OS 13_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.1 Mobile/15E148 Safari/604.1",
+		"Mozilla/5.0 (iPhone; CPU iPhone OS 13_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.1 Mobile/15E148 Safari/604.1",
+		"Mozilla/5.0 (Android 10; Mobile; rv:68.0) Gecko/68.0 Firefox/68.0",
 		"Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.92 Mobile Safari/537.36",
-		"Mozilla/5.0 (Linux; Android 10; SM-A505FN) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.92 Mobile Safari/537.36",
-		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.90 Safari/537.36",
-		"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:68.0) Gecko/20100101 Firefox/68.0",
-		"Mozilla/5.0 (Windows NT 6.1; WOW64; rv:54.0) Gecko/20100101 Firefox/54.0",
-		"Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
-		"Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2)",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Firefox/78.0",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.97 Safari/537.36",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.150 Safari/537.36 Edge/88.0.705.50",
-		"Mozilla/5.0 (Linux; Android 9; SM-G960F Build/PPR1.180610.011) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.110 Mobile Safari/537.36",
-		"Mozilla/5.0 (Linux; U; Android 4.4; en-us; Nexus 5 Build/KRT16M) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.4 Mobile Safari/537.36",
+		"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36",
+		"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:52.0) Gecko/20100101 Firefox/52.0",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.90 Safari/537.36",
+		"Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2; Trident/6.0)",
+		"Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko",
 		"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
 		"Mozilla/5.0 (compatible; Bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+		"Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2272.96 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
 		"Mozilla/5.0 (compatible; Yahoo! Slurp; http://help.yahoo.com/help/us/ysearch/slurp)",
+		"DuckDuckBot/1.0; (+http://duckduckgo.com/duckduckbot.html)",
 		"Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)",
+		"Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)",
+		"Mozilla/5.0 (compatible; Pinterestbot/1.0; +http://www.pinterest.com/bot.html)",
+		"Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
+		"Mozilla/5.0 (Slackbot 1.0; +http://www.slack.com)",
 	}
 
-	config := ScannerConfig{
-		baseURL:       *baseURL,
-		pathsFile:     *pathsFile,
-		concurrent:    *concurrent,
-		timeout:       *timeout,
-		userAgents:    userAgents,
-		adaptiveDelay: *adaptiveDelay,
+	results := make(chan string, len(paths))
+	startTime := time.Now()
+	var wg sync.WaitGroup
+
+	for _, path := range paths {
+		if atomic.LoadInt32(&concurrent32) > 0 {
+			wg.Add(1)
+			go scanTarget(cfg.BaseURL, path, &wg, results, userAgents, &cfg.AdaptiveDelay, &concurrent32, cfg.Timeout)
+		} else {
+			time.Sleep(cfg.AdaptiveDelay)
+		}
 	}
 
-	runScanner(config)
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for r := range results {
+		fmt.Print(r)
+	}
+
+	endTime := time.Now()
+	duration := endTime.Sub(startTime)
+	totalURLs := len(paths)
+
+	fmt.Printf("Scanned %d URLs in %v.\n", totalURLs, duration)
 }
