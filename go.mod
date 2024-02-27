@@ -1,3 +1,3 @@
-module web_vuln_scanner
+module ByteSeeker
 
 go 1.22
