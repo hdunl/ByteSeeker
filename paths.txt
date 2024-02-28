@@ -8,7 +8,6 @@
 /admin/dashboard
 /dashboard
 /phpmyadmin
-/blog
 /webmail
 /mail
 /admincp
@@ -128,3 +127,4 @@
 /panel/administrator
 /panel/user
 /secure
+/blog
