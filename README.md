@@ -19,14 +19,14 @@ Before you start using ByteSeeker, ensure you have the following installed:
 
 Clone this repository to your local machine and build the project:
 - git clone https://github.com/hdunl/ByteSeeker.git
-- cd ByteSeeker/cmd
+- cd ByteSeeker
 - go build
 
 ## Usage
 
 To use ByteSeeker, you need to specify the base URL you wish to scan and the file containing the paths to scan. Additional flags can be used to customize the scan.
 - ./ByteSeeker -url http://example.com -paths paths.txt -concurrent 10 -timeout 10s -adaptiveDelay 100ms
-- Results may vary depending on flag configuration, higher concurrency and lower timeouts may cause results to be incorrect due to web server behavior. The recommended timeout is 10.
+- Results may vary depending on flag configuration; higher concurrency and lower timeouts may cause results to be incorrect due to web server behavior. The recommended timeout is 10.
 
 ### Flags
 
@@ -35,3 +35,5 @@ To use ByteSeeker, you need to specify the base URL you wish to scan and the fil
 - `-concurrent`: Number of concurrent goroutines for scanning (default 10).
 - `-timeout`: HTTP request timeout (default 10s).
 - `-adaptiveDelay`: Initial adaptive delay between requests (default 100ms).
+- `-o`: Output file type (XML, TXT, JSON)
+- `-f`: Output file name. Must contain the extension as of right now. [REQUIRED IF USING `-o`]
