@@ -1,6 +1,6 @@
 # ByteSeeker
 
-ByteSeeker is a performance-centered web scanner tool written in Go, designed to efficiently scan and identify accessible web paths on a given website. With concurrent scanning capabilities, adaptive request delaying, and customizable user agent strings, ByteSeeker offers a robust platform to discover potential vulnerabilities or enumerate resources on web servers.
+ByteSeeker is a performance-centered web scanner tool written in Go, designed to efficiently scan and identify accessible web paths on a given website. With concurrent scanning capabilities, adaptive request delaying, and customizable user agent strings.
 
 ## Features
 
